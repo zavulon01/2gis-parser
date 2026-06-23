@@ -262,12 +262,13 @@ async def scrape_query(page, city, keyword):
             await page.evaluate("""async () => {
                 const container = document.querySelector('div._1667t0u') || document.querySelector('div._15gu4wr') || document.querySelector('div._8hh56jx');
                 if (container) {
-                    for (let i = 0; i < 3; i++) {
+                    for (let i = 0; i < 5; i++) {
                         container.scrollTop = container.scrollHeight;
-                        await new Promise(resolve => setTimeout(resolve, 600));
+                        await new Promise(resolve => setTimeout(resolve, 800));
                     }
                 }
             }""")
+            await page.wait_for_timeout(1500)
             
             # Check for the "No exact matches" text in 2GIS (marks the end of results)
             no_match = await page.query_selector("text='Точных совпадений нет'")
