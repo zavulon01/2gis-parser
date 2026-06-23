@@ -181,21 +181,51 @@ async def bypass_warning(page, correct_url):
 
 async def extract_firms(page):
     """Extracts business names and relative links from search results cards, preserving order."""
-    links = await page.eval_on_selector_all(
-        "div._1kf6gff a[href*='/firm/']",
-        "elements => elements.map(el => ({ href: el.getAttribute('href') || '', name: el.innerText.trim() }))"
-    )
+    links = await page.evaluate("""() => {
+        const firstCardLink = document.querySelector('a[href*="/firm/"]');
+        if (!firstCardLink) return [];
+        
+        // Find list wrapper
+        let cardElement = firstCardLink;
+        let listWrapper = null;
+        while (cardElement && cardElement !== document.body) {
+            const parent = cardElement.parentElement;
+            if (parent) {
+                const siblingCards = Array.from(parent.children);
+                const cardsWithLinks = siblingCards.filter(sibling => sibling.querySelector('a[href*="/firm/"]'));
+                if (cardsWithLinks.length >= 3) {
+                    listWrapper = parent;
+                    break;
+                }
+            }
+            cardElement = parent;
+        }
+        
+        if (!listWrapper) return [];
+        
+        // For each direct child of listWrapper, get the first a[href*='/firm/']
+        const children = Array.from(listWrapper.children);
+        return children.map(child => {
+            const a = child.querySelector("a[href*='/firm/']");
+            if (!a) return null;
+            
+            // Try to find the heading or title element inside this card
+            let name = a.innerText.trim();
+            const header = child.querySelector('h1, h2, h3, div[class*="title"], span[class*="title"]');
+            if (header) {
+                name = header.innerText.trim();
+            }
+            return { href: a.getAttribute('href') || '', name: name };
+        }).filter(item => item !== null);
+    }""")
     
     firms = []
-    seen_on_page = set()
     for l in links:
         href = l['href']
         name = l['name']
         if name and "/firm/" in href:
             clean_href = href.split('?')[0]
-            if clean_href not in seen_on_page:
-                seen_on_page.add(clean_href)
-                firms.append((name, href))
+            firms.append((name, clean_href))
     return firms
 
 async def scrape_query(page, city, keyword):
@@ -257,10 +287,27 @@ async def scrape_query(page, city, keyword):
         print(f"Current URL: {page.url}")
         
         try:
-            # Scroll container to load lazy cards
+            # Wait for at least one listing card to be rendered on the page
+            try:
+                await page.wait_for_selector("div._1kf6gff", timeout=5000)
+            except Exception:
+                pass
+                
+            # Reset scroll container to top on new page entry to trigger clean scroll events
+            await page.evaluate("""() => {
+                const containers = Array.from(document.querySelectorAll('div[data-scroll="true"], div._1667t0u, div._15gu4wr, div._8hh56jx'));
+                const container = containers.find(el => el.offsetWidth > 0 && el.offsetHeight > 0);
+                if (container) {
+                    container.scrollTop = 0;
+                }
+            }""")
+            await page.wait_for_timeout(300)
+            
+            # Scroll container step-by-step to load lazy cards
             print(f"[Page {page_num}] Scrolling listing container...")
             await page.evaluate("""async () => {
-                const container = document.querySelector('div._1667t0u') || document.querySelector('div._15gu4wr') || document.querySelector('div._8hh56jx');
+                const containers = Array.from(document.querySelectorAll('div[data-scroll="true"], div._1667t0u, div._15gu4wr, div._8hh56jx'));
+                const container = containers.find(el => el.offsetWidth > 0 && el.offsetHeight > 0);
                 if (container) {
                     for (let i = 0; i < 5; i++) {
                         container.scrollTop = container.scrollHeight;
@@ -268,7 +315,7 @@ async def scrape_query(page, city, keyword):
                     }
                 }
             }""")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(1000)
             
             # Check for the "No exact matches" text in 2GIS (marks the end of results)
             no_match = await page.query_selector("text='Точных совпадений нет'")
@@ -293,9 +340,8 @@ async def scrape_query(page, city, keyword):
             # Add page listings to our collected list (preserving order)
             for name, href in firms:
                 clean_href = href.split('?')[0]
-                if clean_href not in seen_hrefs:
-                    seen_hrefs.add(clean_href)
-                    all_collected_firms.append((name, clean_href))
+                seen_hrefs.add(clean_href)
+                all_collected_firms.append((name, href))
             print(f"[Page {page_num}] Cumulative unique listings: {len(seen_hrefs)}")
             
             # Stop if we collected all expected listings
@@ -349,13 +395,11 @@ async def scrape_query(page, city, keyword):
             
             await next_btn.click()
             
-            # Wait for dynamic page transition
+            # Wait for dynamic page transition (URL change)
             transition_success = False
             for _ in range(25):  # wait up to 5 seconds
                 await page.wait_for_timeout(200)
-                current_firms = await extract_firms(page)
-                current_first_href = current_firms[0][1] if current_firms else ""
-                if page.url != old_url or current_first_href != old_first_href:
+                if page.url != old_url:
                     transition_success = True
                     break
                     
@@ -364,7 +408,7 @@ async def scrape_query(page, city, keyword):
                 break
                 
             page_num += 1
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(1500)
             
         except Exception as page_err:
             print(f"[Error] Failed to scrape page {page_num}: {page_err}")
@@ -586,7 +630,8 @@ async def details_worker(worker_id, proxy, queue, scraped_records, excel_filenam
                 break
                 
             city, keyword, name, href, idx, total_count = task
-            card_url = f"https://2gis.ru{href}"
+            clean_href = href.split('?')[0]
+            card_url = f"https://2gis.ru{clean_href}"
             print(f"[Worker {worker_id}] [{idx}/{total_count}] Processing: {name} | Proxy: {proxy['server']}")
             
             try:
@@ -667,6 +712,7 @@ async def main():
     print(f"[Init] Total proxies: {len(PROXIES)}")
     
     all_scraped_records = []
+    all_crawled_links = []
     excel_filename = "2gis_results.xlsx"
     lock = asyncio.Lock()
     
@@ -695,7 +741,7 @@ async def main():
                 return
             await route.continue_()
             
-        await master_context.route("**/*", block_resources)
+        # await master_context.route("**/*", block_resources)
         master_page = await master_context.new_page()
         await Stealth().apply_stealth_async(master_page)
         
@@ -705,17 +751,30 @@ async def main():
                 try:
                     # 1. Crawl search results to get firm list
                     firm_links = await scrape_query(master_page, city, keyword)
-                    print(f"\n[Master] Found {len(firm_links)} unique business links. Starting parallel details extraction...")
+                    print(f"\n[Master] Found {len(firm_links)} business links (including duplicates). Starting parallel details extraction...")
                     
                     if not firm_links:
                         continue
                         
-                    # 2. Setup asyncio.Queue for details workers
-                    queue = asyncio.Queue()
+                    # Keep track of all crawled links
                     crawl_links = firm_links[:MAX_DETAILS] if MAX_DETAILS else firm_links
-                    
-                    for idx, (name, href) in enumerate(crawl_links):
-                        queue.put_nowait((city, keyword, name, href, idx + 1, len(crawl_links)))
+                    for name, href in crawl_links:
+                        clean_href = href.split('?')[0]
+                        all_crawled_links.append((city, keyword, name, clean_href))
+                        
+                    # 2. Setup asyncio.Queue for details workers
+                    # Deduplicate links for the worker queue
+                    unique_crawl_links = []
+                    seen_crawl = set()
+                    for name, href in crawl_links:
+                        clean_href = href.split('?')[0]
+                        if clean_href not in seen_crawl:
+                            seen_crawl.add(clean_href)
+                            unique_crawl_links.append((name, clean_href))
+                            
+                    queue = asyncio.Queue()
+                    for idx, (name, href) in enumerate(unique_crawl_links):
+                        queue.put_nowait((city, keyword, name, href, idx + 1, len(unique_crawl_links)))
                         
                     # 3. Launch worker tasks (one per proxy)
                     workers = []
@@ -734,7 +793,48 @@ async def main():
                     # Wait for all workers to shut down
                     await asyncio.gather(*workers)
                     
-                    print(f"\n[Finished] Scraped details for city='{city}' | query='{keyword}'. Total collected so far: {len(all_scraped_records)}")
+                    # Reconstruct final records (with duplicates in correct order) and save to excel
+                    details_map = {}
+                    error_records = []
+                    for r in all_scraped_records:
+                        if r["url"] != "None":
+                            try:
+                                clean_path = urllib.parse.urlparse(r["url"]).path
+                                details_map[clean_path] = r
+                            except Exception:
+                                pass
+                        else:
+                            error_records.append(r)
+                            
+                    final_records = []
+                    for c_city, c_keyword, c_name, c_href in all_crawled_links:
+                        if c_href == "None":
+                            continue
+                        clean_path = c_href.split('?')[0]
+                        if clean_path in details_map:
+                            record_copy = details_map[clean_path].copy()
+                            record_copy["url"] = f"https://2gis.ru{clean_path}"
+                            record_copy["City"] = c_city
+                            record_copy["Query"] = c_keyword
+                            final_records.append(record_copy)
+                        else:
+                            final_records.append({
+                                "City": c_city,
+                                "Query": c_keyword,
+                                "name": c_name,
+                                "url": f"https://2gis.ru{clean_path}",
+                                "description": "None",
+                                "address": "None",
+                                "website": "None",
+                                "email": "None",
+                                "phones": [],
+                                "status": "Не собрано"
+                            })
+                    final_records.extend(error_records)
+                    async with lock:
+                        save_results_to_excel(final_records, excel_filename)
+                        
+                    print(f"\n[Finished] Scraped details for city='{city}' | query='{keyword}'. Total crawled (with duplicates): {len(final_records)}")
                     
                 except Exception as search_err:
                     print(f"[Error] Failed to search city='{city}' | query='{keyword}': {search_err}")
@@ -753,7 +853,36 @@ async def main():
                     }
                     async with lock:
                         all_scraped_records.append(record)
-                        save_results_to_excel(all_scraped_records, excel_filename)
+                        all_crawled_links.append((city, keyword, "[Ошибка поиска]", "None"))
+                        # Map and save
+                        final_records = []
+                        for c_city, c_keyword, c_name, c_href in all_crawled_links:
+                            if c_href == "None":
+                                continue
+                            clean_path = c_href.split('?')[0]
+                            if clean_path in details_map:
+                                record_copy = details_map[clean_path].copy()
+                                record_copy["url"] = f"https://2gis.ru{clean_path}"
+                                record_copy["City"] = c_city
+                                record_copy["Query"] = c_keyword
+                                final_records.append(record_copy)
+                            else:
+                                final_records.append({
+                                    "City": c_city,
+                                    "Query": c_keyword,
+                                    "name": c_name,
+                                    "url": f"https://2gis.ru{clean_path}",
+                                    "description": "None",
+                                    "address": "None",
+                                    "website": "None",
+                                    "email": "None",
+                                    "phones": [],
+                                    "status": "Не собрано"
+                                })
+                        # Also find non-url records
+                        non_url_records = [r for r in all_scraped_records if r["url"] == "None"]
+                        final_records.extend(non_url_records)
+                        save_results_to_excel(final_records, excel_filename)
                         
         await master_browser.close()
         
