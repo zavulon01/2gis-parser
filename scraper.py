@@ -149,7 +149,13 @@ def extract_website_from_links(links):
                 if "2gis" in domain or "otello" in domain:
                     continue
                     
-                return decoded
+                # Remove protocol (http:// or https://) from the website URL
+                clean_web = decoded
+                if clean_web.startswith("http://"):
+                    clean_web = clean_web[7:]
+                elif clean_web.startswith("https://"):
+                    clean_web = clean_web[8:]
+                return clean_web
             except Exception:
                 pass
     return None
