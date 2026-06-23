@@ -395,6 +395,9 @@ async def scrape_firm_details(page, firm_href):
         pass
     await page.wait_for_timeout(500)
     
+    # Locate the main contact details container (which is stable via data-rack="true")
+    container = await page.query_selector("div[data-rack='true']")
+    
     # Extract fields with safe defaults in case of element/parsing exceptions
     try:
         name_el = await page.query_selector("h1")
@@ -404,28 +407,35 @@ async def scrape_firm_details(page, firm_href):
         pass
         
     try:
-        desc_el = await page.query_selector("div._1idnaau")
+        # Description is always a div immediately following h1 (h1 + div). Fallback to old obfuscated class.
+        desc_el = await page.query_selector("h1 + div")
+        if not desc_el:
+            desc_el = await page.query_selector("div._1idnaau")
         if desc_el:
             details["description"] = (await desc_el.inner_text()).strip()
     except Exception:
         pass
         
+    # Use the contacts container as search root to prevent leaking website/address/email from ads
+    root_el = container if container else page
+    
     try:
-        address_el = await page.query_selector("a[href*='/geo/']")
+        address_el = await root_el.query_selector("a[href*='/geo/']")
         if address_el:
             details["address"] = (await address_el.inner_text()).strip()
     except Exception:
         pass
         
     try:
-        email_el = await page.query_selector("a[href^='mailto:']")
+        email_el = await root_el.query_selector("a[href^='mailto:']")
         if email_el:
             details["email"] = (await email_el.inner_text()).strip()
     except Exception:
         pass
         
     try:
-        all_links = await page.eval_on_selector_all(
+        # Extract website link ONLY from the contacts container
+        all_links = await root_el.eval_on_selector_all(
             "a",
             "elements => elements.map(el => [el.innerText.trim(), el.getAttribute('href') || ''])"
         )
@@ -437,7 +447,9 @@ async def scrape_firm_details(page, firm_href):
         
     try:
         phone_data = await page.evaluate("""() => {
-            const links = Array.from(document.querySelectorAll("a[href^='tel:']"));
+            const container = document.querySelector("div[data-rack='true']");
+            const root = container || document;
+            const links = Array.from(root.querySelectorAll("a[href^='tel:']"));
             const validPhones = [];
             
             for (const el of links) {
